@@ -29,6 +29,7 @@ from transformers.models.llama.modeling_llama import (
     logger,
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
+    SequenceClassifierOutputWithPast,
 )
 from transformers.modeling_attn_mask_utils import (
     _prepare_4d_causal_attention_mask_for_sdpa,
@@ -44,6 +45,7 @@ from transformers.models.llama.modeling_llama import (
     LlamaDecoderLayer,
     LlamaModel,
     LlamaForCausalLM,
+    LlamaForSequenceClassification,
 )
 
 # For Pytorch 2.1.1
@@ -57,7 +59,7 @@ except:
     LlamaFlashAttention2 = LlamaAttention
 pass
 
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, AutoConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSequenceClassification, BitsAndBytesConfig, AutoConfig
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING
 from transformers import set_seed as transformers_set_seed
 from peft import LoraConfig, TaskType, get_peft_model as _get_peft_model
@@ -1330,6 +1332,183 @@ class LlamaLinearScalingRotaryEmbedding(LlamaRotaryEmbedding):
     pass
 pass
 
+def SequenceClassification_fast_forward(fast_forward_inference):
+    def _SequenceClassification_fast_forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        causal_mask: Optional[BlockDiagonalCausalMask] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        num_logits_to_keep: Optional[int] = 0,
+        logits_to_keep: Optional[int] = 0,
+        *args, **kwargs,
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        
+        if past_key_values is not None:
+            outputs = fast_forward_inference(
+                self,
+                input_ids,
+                past_key_values,
+                position_ids = position_ids,
+                attention_mask = attention_mask,
+            )
+        else:
+            causal_mask = xformers.attn_bias.LowerTriangularMask() if HAS_XFORMERS else None
+
+            output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+            output_hidden_states = (
+                output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+            )
+            return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+            # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+            self.model._has_no_labels = labels is None
+            outputs = self.model(
+                input_ids = input_ids,
+                causal_mask = causal_mask,
+                attention_mask = attention_mask,
+                position_ids = position_ids,
+                past_key_values = past_key_values,
+                inputs_embeds = inputs_embeds,
+                use_cache = use_cache,
+                output_attentions = output_attentions,
+                output_hidden_states = output_hidden_states,
+                return_dict = return_dict,
+            )
+        pass
+        hidden_states = outputs[0]
+
+        bsz, q_len, hd = hidden_states.shape
+        score = self.score.weight
+        logit_softcapping = getattr(self.config, "final_logit_softcapping", 0)
+        logit_scaling     = getattr(self.config, "logit_scale", 0)
+        dtype = score.dtype
+        num_logits_to_keep = max(num_logits_to_keep, logits_to_keep)
+
+        # Output last hidden states without logits if asked
+        if os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1":
+            if num_logits_to_keep != 0:
+                hidden_states = hidden_states[:, -num_logits_to_keep:, :]
+            return SequenceClassifierOutputWithPast(
+                loss = None,
+                logits = hidden_states,
+                past_key_values = outputs.past_key_values,
+                hidden_states = outputs.hidden_states,
+                attentions=  outputs.attentions,
+            )
+        pass
+
+        if bsz == 1 and q_len == 1:
+            logits = torch.mv(score, hidden_states.ravel().to(dtype))
+            logits = logits.unsqueeze(0).unsqueeze(0)
+        elif num_logits_to_keep != 0:
+            logits = self.score(hidden_states[:, -num_logits_to_keep:, :].to(dtype))
+        else:
+            RETURN_LOGITS = os.environ.get("UNSLOTH_RETURN_LOGITS", "0") == "1"
+            # < 1024 Normal Unsloth uses less VRAM!
+            if bsz*q_len <= 1024: RETURN_LOGITS = True
+            
+            if not RETURN_LOGITS and HAS_CUT_CROSS_ENTROPY and labels is not None:
+
+                n_items = kwargs.get("num_items_in_batch", None) or kwargs.get("n_items", None)
+                loss = fused_linear_cross_entropy(
+                    hidden_states      = hidden_states,
+                    lm_weight          = score,
+                    labels             = labels,
+                    num_items_in_batch = n_items,
+                    logit_softcapping  = logit_softcapping,
+                )
+                if not return_dict:
+                    output = (logits,) + outputs[1:]
+                    return (loss,) + output if loss is not None else output
+
+                output = SequenceClassifierOutputWithPast(
+                    loss=loss,
+                    logits=EMPTY_LOGITS,
+                    past_key_values=outputs.past_key_values,
+                    hidden_states=outputs.hidden_states,
+                    attentions=outputs.attentions,
+                )
+                return output
+            pass
+            logits = self.score(hidden_states.to(dtype))
+        pass
+
+        torch_dtype = __DTYPE_MAP.get(self.config.torch_dtype, None)
+        if torch_dtype is not None:
+            logits = logits.to(torch_dtype)
+        else:
+            raise TypeError("Unsloth: torch_dtype for models is not bfloat16, float16 or float32!")
+        pass
+
+        loss = None
+        logit_softcapping = getattr(self.config, "final_logit_softcapping", 0)
+        logit_scaling     = getattr(self.config, "logit_scale", 0)
+        if self.config.model_type == "granite":
+            # granite uses logit_scaling as key and they divide by the scale unlike cohere
+            # notice that for granite, logits_scale is 16 and for cohere it is 0.125 (aka 1/8) in their respective configs
+            # granite: https://github.com/huggingface/transformers/blob/4d1d0f29a493098e6bc6b904b82e29cb331827f5/src/transformers/models/granite/modeling_granite.py#L1103
+            # cohere: https://github.com/huggingface/transformers/blob/4d1d0f29a493098e6bc6b904b82e29cb331827f5/src/transformers/models/cohere/modeling_cohere.py#L1176
+            logit_scaling = 1 / getattr(self.config, "logits_scaling", 1)
+
+        if labels is not None:
+            shift_logits = logits
+            if not hasattr(self, "extra_ignored_labels"):
+                # Fixes https://github.com/unslothai/unsloth/issues/10
+                self.extra_ignored_labels = torch.full((self.max_seq_length, 1), -100, device = "cuda:0")
+            pass
+            shift_labels = torch.hstack((labels[..., 1:], self.extra_ignored_labels[:labels.shape[0]]))
+            loss = fast_cross_entropy_loss(
+                logits = shift_logits,
+                labels = shift_labels,
+                logit_softcapping = logit_softcapping,
+                logit_scaling     = logit_scaling,
+                n_items           = kwargs.get("num_items_in_batch", None) or kwargs.get("n_items", None),
+            )
+        else:
+            if logit_scaling != 0:
+                if logits.requires_grad:
+                    logits = logit_scaling * logits
+                else:
+                    logits *= logit_scaling
+                pass
+            pass
+            if logit_softcapping != 0:
+                if logits.requires_grad:
+                    logits = (1.0 / logit_softcapping) * logits
+                    logits = torch.tanh(logits)
+                    logits = logit_softcapping * logits
+                else:
+                    logits *= (1.0 / logit_softcapping)
+                    torch.tanh(logits, out = logits)
+                    logits *= logit_softcapping
+                pass
+            pass
+        pass
+
+        if not return_dict:
+            output = (logits,) + outputs[1:]
+            return (loss,) + output if loss is not None else output
+
+        return SequenceClassifierOutputWithPast(
+            loss = loss,
+            logits = logits,
+            past_key_values = outputs.past_key_values,
+            hidden_states = outputs.hidden_states,
+            attentions=  outputs.attentions,
+        )
+    pass
+    return _SequenceClassification_fast_forward
+pass
+
+
 
 # See https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/rotary_embedding.py#L736
 # For Llama 3.1
@@ -1640,6 +1819,7 @@ class FastLlamaModel:
         LlamaDecoderLayer   .forward = LlamaDecoderLayer_fast_forward
         LlamaModel          .forward = LlamaModel_fast_forward
         LlamaForCausalLM    .forward = CausalLM_fast_forward(LlamaModel_fast_forward_inference)
+        LlamaForSequenceClassification.forward = SequenceClassification_fast_forward(LlamaModel_fast_forward_inference)
         PeftModelForCausalLM.forward = PeftModelForCausalLM_fast_forward
         fix_prepare_inputs_for_generation(LlamaForCausalLM)
 
@@ -1658,6 +1838,7 @@ class FastLlamaModel:
     @staticmethod
     def from_pretrained(
         model_name        = "unsloth/llama-3-8b-bnb-4bit",
+        task              = "generate"
         max_seq_length    = None,
         dtype             = None,
         load_in_4bit      = True,
@@ -1792,7 +1973,7 @@ class FastLlamaModel:
         # Cannot be None, since HF now checks for the config
         if load_in_4bit: kwargs["quantization_config"] = bnb_config
         
-        if not fast_inference:
+        if not fast_inference and task == 'generate':
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,
                 device_map              = device_map,
@@ -1801,6 +1982,17 @@ class FastLlamaModel:
                 token                   = token,
                 max_position_embeddings = max_position_embeddings,
                 trust_remote_code       = trust_remote_code,
+                attn_implementation     = "eager",
+                **kwargs,
+            )
+        else if not fast_inference and task == 'classify':
+            model = AutoModelForSequenceClassification.from_pretrained(
+                model_name,
+                device_map              = device_map,
+                torch_dtype             = dtype,
+                token                   = token,
+                max_position_embeddings = max_position_embeddings,
+                trust_rempote_code      = trust_remote_code,
                 attn_implementation     = "eager",
                 **kwargs,
             )
@@ -1814,6 +2006,7 @@ class FastLlamaModel:
             allowed_args = inspect.getfullargspec(load_vllm).args
             load_vllm_kwargs = dict(
                 model_name             = model_name,
+                task                   = task,
                 config                 = model_config,
                 gpu_memory_utilization = gpu_memory_utilization,
                 max_seq_length         = max_seq_length,
